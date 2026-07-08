@@ -214,9 +214,13 @@ jobs:
       - name: Build + load aws-provider kwok controller image into KIND
         run: |
           set -euo pipefail
-          # ko build the aws-provider kwok binary and side-load into kind
+          # ko build the aws-provider kwok binary and side-load into kind.
+          # Do NOT use --bare here: with kind.local, --bare drives ko to
+          # attempt an internal 'ctr images tag ... :latest' that fails
+          # because the digest-named image is not addressable by ctr. Match
+          # karpenter-core's build-with-kind pattern (no --bare, tag=latest).
           cd "$GITHUB_WORKSPACE"
-          IMG=$(KO_DOCKER_REPO=kind.local ko build --bare ./kwok)
+          IMG=$(KO_DOCKER_REPO=kind.local ko build ./kwok)
           echo "built image: $IMG"
           echo "IMG=$IMG" >> "$GITHUB_ENV"
 
@@ -229,14 +233,16 @@ jobs:
           kubectl apply -f ./pkg/apis/crds/
           # Apply the kwok-specific ClusterRole (referenced in kwok/Makefile)
           KARPENTER_NAMESPACE=kube-system envsubst < ./kwok/manifests/clusterrole.yaml | kubectl apply -f -
+          # ko (without --bare) prints repo:tag@digest. Extract components.
           IMG_REPOSITORY=$(echo "$IMG" | cut -d "@" -f 1 | cut -d ":" -f 1)
+          IMG_TAG=$(echo "$IMG" | cut -d "@" -f 1 | cut -d ":" -f 2 -s)
           IMG_DIGEST=$(echo "$IMG" | cut -d "@" -f 2)
-          echo "deploying $IMG_REPOSITORY @ $IMG_DIGEST"
+          echo "deploying repository=$IMG_REPOSITORY tag=$IMG_TAG digest=$IMG_DIGEST"
           helm upgrade --install kwok-karpenter ./charts/karpenter \
             --namespace kube-system \
             --create-namespace \
             --set controller.image.repository="$IMG_REPOSITORY" \
-            --set controller.image.tag="ko-build" \
+            --set controller.image.tag="$IMG_TAG" \
             --set controller.image.digest="$IMG_DIGEST" \
             --set settings.clusterName="$CLUSTER_NAME" \
             --set settings.clusterEndpoint="$CLUSTER_ENDPOINT" \
