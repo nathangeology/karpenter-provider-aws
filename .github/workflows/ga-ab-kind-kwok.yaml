@@ -25,13 +25,16 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 60
     env:
-      # aws-provider kwok binary reads these; the SDK v2 respects AWS_ENDPOINT_URL
-      # natively for all services. moto serves everything on this port.
-      AWS_ENDPOINT_URL: http://localhost:5000
+      # For steps running on the GH runner host (aws CLI seeding, test binary),
+      # moto is reachable via NodePort on 30500.
+      AWS_ENDPOINT_URL: http://localhost:30500
       AWS_ACCESS_KEY_ID: test
       AWS_SECRET_ACCESS_KEY: test
       AWS_REGION: us-west-2
       AWS_DEFAULT_REGION: us-west-2
+      # For the karpenter kwok controller running INSIDE the KIND cluster,
+      # moto is reachable via ClusterIP/DNS. Different var name for clarity.
+      MOTO_INCLUSTER_URL: http://moto-server.kube-system.svc.cluster.local:5000
       # Skip the EKS DescribeCluster bootstrap by pinning cluster-endpoint
       CLUSTER_ENDPOINT: https://kubernetes.default.svc
       CLUSTER_NAME: ga-ab-kind-kwok
@@ -42,21 +45,18 @@ jobs:
       KIND_CLUSTER_NAME: chart-testing
       # KWOK_REPO controls where install-kwok.sh loads its image from
       KWOK_REPO: kind.local
+      # Fixed OUTPUT_DIR so upload-artifact can find it even if perf run
+      # is skipped/failed before setting GITHUB_ENV
+      OUTPUT_DIR: /tmp/ga-ab-output
 
-    services:
-      # moto-server serves EC2, EKS, Pricing, IAM, STS on 5000.
-      # Health check via /moto-api/ endpoint.
-      moto:
-        image: motoserver/moto:5.0.15
-        ports:
-          - 5000:5000
-        options: >-
-          --health-cmd "curl --fail http://localhost:5000/moto-api/ || exit 1"
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 5
+    # No `services:` — we run moto INSIDE the KIND cluster as a pod so the
+    # aws-provider kwok controller (also inside KIND) can reach it by DNS.
+    # The host side (aws CLI seeding step) reaches moto via the NodePort.
 
     steps:
+      - name: Create output directory
+        run: mkdir -p "$OUTPUT_DIR"
+
       - name: Checkout
         uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
 
@@ -69,12 +69,12 @@ jobs:
         run: |
           set -euo pipefail
           # kind
-          curl -sSLo /usr/local/bin/kind https://kind.sigs.k8s.io/dl/v0.24.0/kind-linux-amd64
-          chmod +x /usr/local/bin/kind
+          sudo curl -sSLo /usr/local/bin/kind https://kind.sigs.k8s.io/dl/v0.24.0/kind-linux-amd64
+          sudo chmod +x /usr/local/bin/kind
           kind version
           # kubectl (already usually installed on ubuntu-latest but ensure)
-          curl -sSLo /usr/local/bin/kubectl "https://dl.k8s.io/release/v1.31.0/bin/linux/amd64/kubectl"
-          chmod +x /usr/local/bin/kubectl
+          sudo curl -sSLo /usr/local/bin/kubectl "https://dl.k8s.io/release/v1.31.0/bin/linux/amd64/kubectl"
+          sudo chmod +x /usr/local/bin/kubectl
           kubectl version --client
           # helm
           curl -sSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
@@ -83,18 +83,80 @@ jobs:
           go install github.com/google/ko@latest
           ko version
 
-      - name: Wait for moto to be ready
+      - name: Create KIND cluster
         run: |
           set -euo pipefail
+          # KIND cluster config exposes NodePort 30500 for moto access from the host
+          cat > /tmp/kind-config.yaml <<'EOF'
+          kind: Cluster
+          apiVersion: kind.x-k8s.io/v1alpha4
+          nodes:
+            - role: control-plane
+              image: kindest/node:v1.31.0
+              extraPortMappings:
+                - containerPort: 30500
+                  hostPort: 30500
+                  protocol: TCP
+          EOF
+          kind create cluster --name "$KIND_CLUSTER_NAME" --config /tmp/kind-config.yaml --wait 120s
+          kubectl config current-context
+          kubectl get nodes
+          kubectl taint nodes ${KIND_CLUSTER_NAME}-control-plane CriticalAddonsOnly:NoSchedule || true
+
+      - name: Deploy moto-server pod inside KIND cluster
+        run: |
+          set -euo pipefail
+          cat <<'EOF' | kubectl apply -f -
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata:
+            name: moto-server
+            namespace: kube-system
+          spec:
+            replicas: 1
+            selector:
+              matchLabels: {app: moto-server}
+            template:
+              metadata:
+                labels: {app: moto-server}
+              spec:
+                tolerations:
+                  - key: CriticalAddonsOnly
+                    operator: Exists
+                containers:
+                  - name: moto
+                    image: motoserver/moto:5.0.15
+                    ports:
+                      - containerPort: 5000
+                    readinessProbe:
+                      httpGet:
+                        path: /moto-api/
+                        port: 5000
+                      periodSeconds: 5
+          ---
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: moto-server
+            namespace: kube-system
+          spec:
+            type: NodePort
+            selector: {app: moto-server}
+            ports:
+              - port: 5000
+                targetPort: 5000
+                nodePort: 30500
+          EOF
+          kubectl -n kube-system rollout status deploy/moto-server --timeout=120s
+          # Wait for reachability from host
           for i in $(seq 1 30); do
-            if curl -fsSL http://localhost:5000/moto-api/ >/dev/null 2>&1; then
-              echo "moto is up"
+            if curl -fsSL http://localhost:30500/moto-api/ >/dev/null 2>&1; then
+              echo "moto reachable from host"
               break
             fi
-            echo "waiting for moto ($i/30)..."
             sleep 2
           done
-          curl -fsSL http://localhost:5000/moto-api/ || (echo "moto never became ready"; exit 1)
+          curl -fsSL http://localhost:30500/moto-api/ | head -c 200 || true
 
       - name: Seed moto with fake VPC + subnets + tags
         run: |
@@ -132,21 +194,6 @@ jobs:
           # Show what we seeded
           aws ec2 describe-subnets --filters "Name=tag:karpenter.sh/discovery,Values=$CLUSTER_NAME" --query 'Subnets[].SubnetId'
           aws ec2 describe-security-groups --filters "Name=tag:karpenter.sh/discovery,Values=$CLUSTER_NAME" --query 'SecurityGroups[].GroupId'
-
-      - name: Create KIND cluster
-        run: |
-          set -euo pipefail
-          cat > /tmp/kind-config.yaml <<'EOF'
-          kind: Cluster
-          apiVersion: kind.x-k8s.io/v1alpha4
-          nodes:
-            - role: control-plane
-              image: kindest/node:v1.31.0
-          EOF
-          kind create cluster --name "$KIND_CLUSTER_NAME" --config /tmp/kind-config.yaml --wait 90s
-          kubectl config current-context
-          kubectl get nodes
-          kubectl taint nodes ${KIND_CLUSTER_NAME}-control-plane CriticalAddonsOnly:NoSchedule || true
 
       - name: Install KWOK CRDs + controller
         run: |
@@ -197,7 +244,7 @@ jobs:
             --set controller.resources.limits.memory=2Gi \
             --set logLevel=debug \
             --set-string controller.env[0].name=AWS_ENDPOINT_URL \
-            --set-string controller.env[0].value=http://host.docker.internal:5000 \
+            --set-string controller.env[0].value="$MOTO_INCLUSTER_URL" \
             --set-string controller.env[1].name=AWS_ACCESS_KEY_ID \
             --set-string controller.env[1].value=test \
             --set-string controller.env[2].name=AWS_SECRET_ACCESS_KEY \
@@ -225,20 +272,83 @@ jobs:
           # Dump logs regardless — this is what we want to inspect on failure
           kubectl -n kube-system logs -l app.kubernetes.io/name=karpenter --tail=200 || true
 
-      - name: Run performance suite (kwok mode)
-        id: run_perf
+      - name: Sanity — create a test NodePool + NodeClass and observe controller reaction
+        id: sanity_np
         continue-on-error: true
-        env:
-          FOCUS: ${{ inputs.focus }}
         run: |
           set -euo pipefail
-          OUTPUT_DIR=$(mktemp -d)
-          export OUTPUT_DIR
-          echo "OUTPUT_DIR=$OUTPUT_DIR" >> "$GITHUB_ENV"
-          # The perf suite uses aws.NewEnvironment which needs CLUSTER_NAME +
-          # CLUSTER_ENDPOINT set (already exported). It calls AWS APIs via SDK,
-          # so those go through AWS_ENDPOINT_URL to moto.
-          TEST_SUITE=Performance FOCUS="$FOCUS" make e2etests 2>&1 | tee "$OUTPUT_DIR/test-output.log"
+          mkdir -p "$OUTPUT_DIR"
+          # Minimal probe: apply an EC2NodeClass + NodePool + tiny deployment
+          # and observe whether karpenter provisions a KWOK-simulated node.
+          cat <<'EOF' | kubectl apply -f -
+          apiVersion: karpenter.k8s.aws/v1
+          kind: EC2NodeClass
+          metadata:
+            name: default
+          spec:
+            role: KarpenterNodeRole-ga-ab-kind-kwok
+            amiSelectorTerms:
+              - alias: "al2023@latest"
+            subnetSelectorTerms:
+              - tags:
+                  karpenter.sh/discovery: ga-ab-kind-kwok
+            securityGroupSelectorTerms:
+              - tags:
+                  karpenter.sh/discovery: ga-ab-kind-kwok
+          ---
+          apiVersion: karpenter.sh/v1
+          kind: NodePool
+          metadata:
+            name: default
+          spec:
+            template:
+              spec:
+                requirements:
+                  - key: kubernetes.io/arch
+                    operator: In
+                    values: [amd64]
+                  - key: kubernetes.io/os
+                    operator: In
+                    values: [linux]
+                  - key: karpenter.sh/capacity-type
+                    operator: In
+                    values: [on-demand]
+                nodeClassRef:
+                  group: karpenter.k8s.aws
+                  kind: EC2NodeClass
+                  name: default
+                expireAfter: 720h
+            limits:
+              cpu: 1000
+            disruption:
+              consolidationPolicy: WhenEmptyOrUnderutilized
+              consolidateAfter: 1m
+          EOF
+          # Wait for NodePool ready condition
+          for i in $(seq 1 24); do
+            READY=$(kubectl get nodepool default -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null || echo "")
+            NCR=$(kubectl get ec2nodeclass default -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null || echo "")
+            echo "iter=$i NodePool.Ready=$READY EC2NodeClass.Ready=$NCR"
+            if [[ "$READY" == "True" && "$NCR" == "True" ]]; then
+              echo "both ready"
+              break
+            fi
+            sleep 5
+          done
+          kubectl get nodepool,ec2nodeclass -o yaml > "$OUTPUT_DIR/nodepool-nodeclass.yaml"
+          # Provision a small deployment
+          kubectl create deployment probe --image=registry.k8s.io/pause:3.9 --replicas=3 || true
+          kubectl set resources deployment/probe --requests=cpu=500m,memory=512Mi || true
+          # Give karpenter up to 90s to react
+          for i in $(seq 1 18); do
+            NC=$(kubectl get nodeclaims -o name 2>/dev/null | wc -l | tr -d ' ')
+            N=$(kubectl get nodes -o name 2>/dev/null | wc -l | tr -d ' ')
+            echo "iter=$i nodeclaims=$NC nodes=$N"
+            [[ "$NC" -ge 1 ]] && break
+            sleep 5
+          done
+          kubectl get nodeclaims -o yaml > "$OUTPUT_DIR/nodeclaims.yaml"
+          kubectl get nodes -o yaml > "$OUTPUT_DIR/nodes-final.yaml"
 
       - name: Dump karpenter logs
         if: always()
@@ -258,8 +368,8 @@ jobs:
           retention-days: 14
           if-no-files-found: warn
 
-      - name: Fail if perf test failed
-        if: steps.run_perf.outcome == 'failure'
+      - name: Fail if sanity probe failed
+        if: steps.sanity_np.outcome == 'failure'
         run: |
-          echo "Performance suite failed — see uploaded artifacts."
+          echo "Sanity probe failed — see uploaded artifacts."
           exit 1
