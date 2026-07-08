@@ -200,8 +200,12 @@ jobs:
           set -euo pipefail
           # Use karpenter-core's install-kwok.sh (referenced via go.mod dep dir).
           # This installs KWOK controller + kwok stage/policy configs into the cluster.
+          # Populate the module cache first — go list -m returns empty otherwise.
+          go mod download sigs.k8s.io/karpenter
           KARPENTER_CORE_DIR=$(go list -m -f '{{ .Dir }}' sigs.k8s.io/karpenter)
           echo "KARPENTER_CORE_DIR=$KARPENTER_CORE_DIR"
+          [ -n "$KARPENTER_CORE_DIR" ] || { echo 'go list failed to resolve sigs.k8s.io/karpenter'; exit 1; }
+          [ -f "$KARPENTER_CORE_DIR/hack/install-kwok.sh" ] || { echo "install-kwok.sh not found at $KARPENTER_CORE_DIR/hack/install-kwok.sh"; ls -la "$KARPENTER_CORE_DIR" || true; exit 1; }
           chmod +x "$KARPENTER_CORE_DIR/hack/install-kwok.sh"
           UNINSTALL_KWOK=false "$KARPENTER_CORE_DIR/hack/install-kwok.sh"
           kubectl -n kube-system rollout status deploy/kwok-controller --timeout=120s || true
