@@ -238,6 +238,10 @@ jobs:
           IMG_TAG=$(echo "$IMG" | cut -d "@" -f 1 | cut -d ":" -f 2 -s)
           IMG_DIGEST=$(echo "$IMG" | cut -d "@" -f 2)
           echo "deploying repository=$IMG_REPOSITORY tag=$IMG_TAG digest=$IMG_DIGEST"
+          # Tolerate the CriticalAddonsOnly:NoSchedule taint on the control-plane
+          # node (see 'Create KIND cluster' step). Without it karpenter pods
+          # remain Pending and no measurement is ever emitted (kp-mtykyu regression).
+          # Also drop replicas from 2 to 1 to fit the 4-vCPU/16Gi ubuntu-latest runner.
           helm upgrade --install kwok-karpenter ./charts/karpenter \
             --namespace kube-system \
             --create-namespace \
@@ -248,6 +252,10 @@ jobs:
             --set settings.clusterEndpoint="$CLUSTER_ENDPOINT" \
             --set settings.featureGates.reservedCapacity=false \
             --set settings.enableZonalShift=false \
+            --set replicas=1 \
+            --set-string tolerations[0].key=CriticalAddonsOnly \
+            --set-string tolerations[0].operator=Exists \
+            --set-string tolerations[0].effect=NoSchedule \
             --set controller.resources.requests.cpu=1 \
             --set controller.resources.requests.memory=1Gi \
             --set controller.resources.limits.cpu=2 \
@@ -279,94 +287,102 @@ jobs:
             sleep 5
           done
           kubectl -n kube-system get pods -l app.kubernetes.io/name=karpenter
-          # Dump logs regardless — this is what we want to inspect on failure
+          # Hard-fail if karpenter is not ready — otherwise the perf test will
+          # silently produce no data (see kp-mtykyu false-green regression).
+          READY=$(kubectl -n kube-system get pods -l app.kubernetes.io/name=karpenter -o jsonpath='{.items[*].status.containerStatuses[*].ready}' 2>/dev/null || echo "")
+          if [[ "$READY" != *"true"* ]]; then
+            echo "FAIL: karpenter pod never became ready. Dumping state before exiting."
+            kubectl -n kube-system describe pods -l app.kubernetes.io/name=karpenter || true
+            kubectl -n kube-system logs -l app.kubernetes.io/name=karpenter --tail=200 || true
+            exit 1
+          fi
+          # Dump logs regardless — useful for post-mortem
           kubectl -n kube-system logs -l app.kubernetes.io/name=karpenter --tail=200 || true
 
-      - name: Sanity — create a test NodePool + NodeClass and observe controller reaction
-        id: sanity_np
-        continue-on-error: true
+      - name: Run Basic Deployment perf test (Scale Out phase)
+        id: perf_run
         run: |
-          set -euo pipefail
+          set -uo pipefail
+          # Invoke the ported OSS performance suite. Focus is passed via input
+          # (default 'Basic Deployment' which matches the "should efficiently
+          # scale two deployments..." spec under Context('Basic Deployment')).
+          # We DO NOT hard-gate the workflow on the go test exit code — the
+          # test has OSS-tuned numeric thresholds (TotalTime<2m, CPU>53%,
+          # etc) that were calibrated for real EKS and will fail on KIND+KWOK.
+          # The A/B is done against the same env on both sides, so absolute
+          # thresholds don't matter — the emitted TotalTime measurement is
+          # what we compare. Hard-gate is in the next step: assertion of
+          # non-empty JSON report + karpenter.log content + NodeClaims.
+          cd "$GITHUB_WORKSPACE"
           mkdir -p "$OUTPUT_DIR"
-          # Minimal probe: apply an EC2NodeClass + NodePool + tiny deployment
-          # and observe whether karpenter provisions a KWOK-simulated node.
-          cat <<'EOF' | kubectl apply -f -
-          apiVersion: karpenter.k8s.aws/v1
-          kind: EC2NodeClass
-          metadata:
-            name: default
-          spec:
-            role: KarpenterNodeRole-ga-ab-kind-kwok
-            amiSelectorTerms:
-              - alias: "al2023@latest"
-            subnetSelectorTerms:
-              - tags:
-                  karpenter.sh/discovery: ga-ab-kind-kwok
-            securityGroupSelectorTerms:
-              - tags:
-                  karpenter.sh/discovery: ga-ab-kind-kwok
-          ---
-          apiVersion: karpenter.sh/v1
-          kind: NodePool
-          metadata:
-            name: default
-          spec:
-            template:
-              spec:
-                requirements:
-                  - key: kubernetes.io/arch
-                    operator: In
-                    values: [amd64]
-                  - key: kubernetes.io/os
-                    operator: In
-                    values: [linux]
-                  - key: karpenter.sh/capacity-type
-                    operator: In
-                    values: [on-demand]
-                nodeClassRef:
-                  group: karpenter.k8s.aws
-                  kind: EC2NodeClass
-                  name: default
-                expireAfter: 720h
-            limits:
-              cpu: 1000
-            disruption:
-              consolidationPolicy: WhenEmptyOrUnderutilized
-              consolidateAfter: 1m
-          EOF
-          # Wait for NodePool ready condition
-          for i in $(seq 1 24); do
-            READY=$(kubectl get nodepool default -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null || echo "")
-            NCR=$(kubectl get ec2nodeclass default -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null || echo "")
-            echo "iter=$i NodePool.Ready=$READY EC2NodeClass.Ready=$NCR"
-            if [[ "$READY" == "True" && "$NCR" == "True" ]]; then
-              echo "both ready"
-              break
-            fi
-            sleep 5
-          done
-          kubectl get nodepool,ec2nodeclass -o yaml > "$OUTPUT_DIR/nodepool-nodeclass.yaml"
-          # Provision a small deployment
-          kubectl create deployment probe --image=registry.k8s.io/pause:3.9 --replicas=3 || true
-          kubectl set resources deployment/probe --requests=cpu=500m,memory=512Mi || true
-          # Give karpenter up to 90s to react
-          for i in $(seq 1 18); do
-            NC=$(kubectl get nodeclaims -o name 2>/dev/null | wc -l | tr -d ' ')
-            N=$(kubectl get nodes -o name 2>/dev/null | wc -l | tr -d ' ')
-            echo "iter=$i nodeclaims=$NC nodes=$N"
-            [[ "$NC" -ge 1 ]] && break
-            sleep 5
-          done
-          kubectl get nodeclaims -o yaml > "$OUTPUT_DIR/nodeclaims.yaml"
-          kubectl get nodes -o yaml > "$OUTPUT_DIR/nodes-final.yaml"
+          FOCUS="${{ inputs.focus }}"
+          echo "ginkgo focus: $FOCUS"
+          echo "OUTPUT_DIR: $OUTPUT_DIR"
+          # Run the perf suite. -count=1 to avoid caching; -timeout matches
+          # ReportScaleOutWithOutput's 15-minute internal deadline + slack.
+          go test -v -count=1 -timeout=45m \
+            -ginkgo.v -ginkgo.focus="$FOCUS" -ginkgo.timeout=40m \
+            ./test/suites/performance/... 2>&1 | tee "$OUTPUT_DIR/perf.log"
+          # Save the exit code for the next step to inspect.
+          echo "perf_exit=${PIPESTATUS[0]}" >> "$GITHUB_OUTPUT"
 
       - name: Dump karpenter logs
         if: always()
         run: |
-          kubectl -n kube-system logs -l app.kubernetes.io/name=karpenter --tail=500 > "$OUTPUT_DIR/karpenter.log" 2>&1 || true
+          kubectl -n kube-system logs -l app.kubernetes.io/name=karpenter --tail=5000 > "$OUTPUT_DIR/karpenter.log" 2>&1 || true
           kubectl get pods -A -o wide > "$OUTPUT_DIR/pods.txt" 2>&1 || true
           kubectl get nodes -o wide > "$OUTPUT_DIR/nodes.txt" 2>&1 || true
           kubectl get nodepools,nodeclaims,ec2nodeclasses -A -o yaml > "$OUTPUT_DIR/kperf.yaml" 2>&1 || true
+
+      - name: Assert benchmark produced measurement data (hard-fail)
+        if: always()
+        run: |
+          set -euo pipefail
+          # Rule: smith-benchmark-sanity-must-verify-data — sanity gates MUST
+          # assert both non-empty metric artifacts AND non-zero measurement
+          # count. Fail loudly if the sanity did not actually measure anything.
+          echo "=== asserting non-empty perf log ==="
+          if [ ! -s "$OUTPUT_DIR/perf.log" ]; then
+            echo "FAIL: perf.log missing or empty at $OUTPUT_DIR/perf.log"; ls -la "$OUTPUT_DIR" || true; exit 1
+          fi
+          echo "=== asserting non-empty karpenter log ==="
+          if [ ! -s "$OUTPUT_DIR/karpenter.log" ]; then
+            echo "FAIL: karpenter.log missing or empty at $OUTPUT_DIR/karpenter.log"; ls -la "$OUTPUT_DIR" || true; exit 1
+          fi
+          echo "=== asserting perf suite reached scale-out reporting (emitted PERFORMANCE REPORT header) ==="
+          if ! grep -q "PERFORMANCE REPORT" "$OUTPUT_DIR/perf.log"; then
+            echo "FAIL: no 'PERFORMANCE REPORT' string in perf.log — the ReportScaleOutWithOutput emitter never fired."
+            echo "This means the test never completed the scale-out phase (probably a controller/API-server hang, moto issue, or NodeClass NotReady)."
+            echo "=== tail of perf.log ==="
+            tail -n 200 "$OUTPUT_DIR/perf.log" || true
+            echo "=== tail of karpenter.log ==="
+            tail -n 200 "$OUTPUT_DIR/karpenter.log" || true
+            exit 1
+          fi
+          echo "=== asserting scale_out_performance_report.json exists and is non-empty ==="
+          REPORT_JSON="$OUTPUT_DIR/scale_out_performance_report.json"
+          if [ ! -s "$REPORT_JSON" ]; then
+            echo "FAIL: $REPORT_JSON missing or empty"; ls -la "$OUTPUT_DIR" || true; exit 1
+          fi
+          echo "--- $REPORT_JSON (first 60 lines) ---"
+          head -n 60 "$REPORT_JSON" || true
+          echo "=== asserting TotalTime > 0 in JSON report ==="
+          # PerformanceReport.TotalTime is a time.Duration marshaled as nanoseconds.
+          # A non-zero value means at least some scale-out was measured.
+          TOTAL_TIME_NS=$(python3 -c 'import json,sys; d=json.load(open("'"$REPORT_JSON"'")); print(d.get("TotalTime", 0))')
+          echo "TotalTime (ns) = $TOTAL_TIME_NS"
+          if [ -z "$TOTAL_TIME_NS" ] || [ "$TOTAL_TIME_NS" = "0" ]; then
+            echo "FAIL: TotalTime is zero in scale_out_performance_report.json — no scale-out was measured."
+            exit 1
+          fi
+          echo "=== asserting at least one NodeClaim was created ==="
+          NC_COUNT=$(kubectl get nodeclaims -o json 2>/dev/null | python3 -c 'import json,sys; print(len(json.load(sys.stdin).get("items",[])))' 2>/dev/null || echo 0)
+          echo "NodeClaim count = $NC_COUNT"
+          if [ "$NC_COUNT" -lt 1 ]; then
+            echo "FAIL: 0 NodeClaims present — karpenter never provisioned anything."
+            exit 1
+          fi
+          echo "=== SANITY OK: perf.log non-empty, karpenter.log non-empty, PERFORMANCE REPORT emitted, TotalTime=$TOTAL_TIME_NS ns, NodeClaims=$NC_COUNT ==="
 
       - name: Upload artifacts
         if: always()
@@ -377,9 +393,3 @@ jobs:
             ${{ env.OUTPUT_DIR }}/*
           retention-days: 14
           if-no-files-found: warn
-
-      - name: Fail if sanity probe failed
-        if: steps.sanity_np.outcome == 'failure'
-        run: |
-          echo "Sanity probe failed — see uploaded artifacts."
-          exit 1
