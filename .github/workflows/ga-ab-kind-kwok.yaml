@@ -239,9 +239,17 @@ jobs:
           IMG_DIGEST=$(echo "$IMG" | cut -d "@" -f 2)
           echo "deploying repository=$IMG_REPOSITORY tag=$IMG_TAG digest=$IMG_DIGEST"
           # Tolerate the CriticalAddonsOnly:NoSchedule taint on the control-plane
-          # node (see 'Create KIND cluster' step). Without it karpenter pods
-          # remain Pending and no measurement is ever emitted (kp-mtykyu regression).
-          # Also drop replicas from 2 to 1 to fit the 4-vCPU/16Gi ubuntu-latest runner.
+          # node (see 'Create KIND cluster' step). The default chart already
+          # includes a CriticalAddonsOnly toleration, but we re-assert it here
+          # in case chart defaults change. Drop replicas from 2 to 1 (fits the
+          # 4-vCPU/16Gi ubuntu-latest runner).
+          #
+          # Also drop the default topologySpreadConstraints (empty array): the
+          # chart defaults to maxSkew=1 topologyKey=topology.kubernetes.io/zone
+          # whenUnsatisfiable=DoNotSchedule, which cannot be satisfied on a
+          # single-node KIND control-plane (no zone label). Kept the default
+          # in place is what left the pod Pending in iteration 0 despite the
+          # toleration being applied (kp-mkukch iter 1).
           helm upgrade --install kwok-karpenter ./charts/karpenter \
             --namespace kube-system \
             --create-namespace \
@@ -253,6 +261,7 @@ jobs:
             --set settings.featureGates.reservedCapacity=false \
             --set settings.enableZonalShift=false \
             --set replicas=1 \
+            --set-json 'topologySpreadConstraints=[]' \
             --set-string tolerations[0].key=CriticalAddonsOnly \
             --set-string tolerations[0].operator=Exists \
             --set-string tolerations[0].effect=NoSchedule \
