@@ -1,0 +1,265 @@
+name: GA-AB-Kind-Kwok
+# GA A/B benchmark for aws-provider hot path using KIND + KWOK + moto.
+# No OIDC, no real EKS/EC2, no cluster provisioning. Runs entirely on the
+# GH runner. moto provides a fake EC2/EKS/Pricing/IAM endpoint; aws-provider's
+# kwok binary is deployed against the KIND cluster and fires against moto for
+# any AWS SDK calls that its kwok/ec2 mock does not override.
+#
+# Fires on: workflow_dispatch. Intentionally NOT gated on repository name so
+# that this workflow runs on nathangeology/karpenter-provider-aws.
+on:
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: 'Free-form label added to the artifact name (n=5 A/B ordinal, etc)'
+        type: string
+        default: '1'
+      focus:
+        description: 'Ginkgo focus regex for the performance suite'
+        type: string
+        default: 'Basic Deployment'
+
+jobs:
+  ab-run:
+    name: ga-ab-kind-kwok (${{ inputs.run_id }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      # aws-provider kwok binary reads these; the SDK v2 respects AWS_ENDPOINT_URL
+      # natively for all services. moto serves everything on this port.
+      AWS_ENDPOINT_URL: http://localhost:5000
+      AWS_ACCESS_KEY_ID: test
+      AWS_SECRET_ACCESS_KEY: test
+      AWS_REGION: us-west-2
+      AWS_DEFAULT_REGION: us-west-2
+      # Skip the EKS DescribeCluster bootstrap by pinning cluster-endpoint
+      CLUSTER_ENDPOINT: https://kubernetes.default.svc
+      CLUSTER_NAME: ga-ab-kind-kwok
+      # Skip the SQS interruption queue path
+      # (unset INTERRUPTION_QUEUE; test env only wires it if set)
+      # Deploy target for ko-built controller image
+      KO_DOCKER_REPO: kind.local
+      KIND_CLUSTER_NAME: chart-testing
+      # KWOK_REPO controls where install-kwok.sh loads its image from
+      KWOK_REPO: kind.local
+
+    services:
+      # moto-server serves EC2, EKS, Pricing, IAM, STS on 5000.
+      # Health check via /moto-api/ endpoint.
+      moto:
+        image: motoserver/moto:5.0.15
+        ports:
+          - 5000:5000
+        options: >-
+          --health-cmd "curl --fail http://localhost:5000/moto-api/ || exit 1"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
+
+      - name: Set up Go
+        uses: actions/setup-go@d35c59abb061a4a6fb18e82ac0862c26744d6ab5 # v6.0.0
+        with:
+          go-version-file: go.mod
+
+      - name: Install kind + kubectl + helm + ko
+        run: |
+          set -euo pipefail
+          # kind
+          curl -sSLo /usr/local/bin/kind https://kind.sigs.k8s.io/dl/v0.24.0/kind-linux-amd64
+          chmod +x /usr/local/bin/kind
+          kind version
+          # kubectl (already usually installed on ubuntu-latest but ensure)
+          curl -sSLo /usr/local/bin/kubectl "https://dl.k8s.io/release/v1.31.0/bin/linux/amd64/kubectl"
+          chmod +x /usr/local/bin/kubectl
+          kubectl version --client
+          # helm
+          curl -sSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+          helm version
+          # ko
+          go install github.com/google/ko@latest
+          ko version
+
+      - name: Wait for moto to be ready
+        run: |
+          set -euo pipefail
+          for i in $(seq 1 30); do
+            if curl -fsSL http://localhost:5000/moto-api/ >/dev/null 2>&1; then
+              echo "moto is up"
+              break
+            fi
+            echo "waiting for moto ($i/30)..."
+            sleep 2
+          done
+          curl -fsSL http://localhost:5000/moto-api/ || (echo "moto never became ready"; exit 1)
+
+      - name: Seed moto with fake VPC + subnets + tags
+        run: |
+          set -euo pipefail
+          # Install AWS CLI already available on ubuntu-latest; verify
+          aws --version
+          # Create VPC + 3 subnets (matching 3 AZs); tag with karpenter.sh/discovery
+          VPC=$(aws ec2 create-vpc --cidr-block 10.0.0.0/16 --output text --query 'Vpc.VpcId')
+          echo "VPC=$VPC"
+          # Enable DNS hostnames just in case
+          aws ec2 modify-vpc-attribute --vpc-id "$VPC" --enable-dns-hostnames || true
+          # 3 subnets across AZs a/b/c
+          for i in 1 2 3; do
+            AZ_LETTER=$(echo abc | cut -c$i)
+            SUBNET=$(aws ec2 create-subnet \
+              --vpc-id "$VPC" \
+              --cidr-block "10.0.$i.0/24" \
+              --availability-zone "us-west-2$AZ_LETTER" \
+              --output text --query 'Subnet.SubnetId')
+            aws ec2 create-tags \
+              --resources "$SUBNET" \
+              --tags "Key=karpenter.sh/discovery,Value=$CLUSTER_NAME" "Key=Name,Value=$CLUSTER_NAME-subnet-$i"
+            echo "subnet-$i=$SUBNET"
+          done
+          # Create a security group; tag it
+          SG=$(aws ec2 create-security-group \
+            --group-name "$CLUSTER_NAME-sg" \
+            --description "$CLUSTER_NAME karpenter mock SG" \
+            --vpc-id "$VPC" \
+            --output text --query 'GroupId')
+          aws ec2 create-tags \
+            --resources "$SG" \
+            --tags "Key=karpenter.sh/discovery,Value=$CLUSTER_NAME"
+          echo "sg=$SG"
+          # Show what we seeded
+          aws ec2 describe-subnets --filters "Name=tag:karpenter.sh/discovery,Values=$CLUSTER_NAME" --query 'Subnets[].SubnetId'
+          aws ec2 describe-security-groups --filters "Name=tag:karpenter.sh/discovery,Values=$CLUSTER_NAME" --query 'SecurityGroups[].GroupId'
+
+      - name: Create KIND cluster
+        run: |
+          set -euo pipefail
+          cat > /tmp/kind-config.yaml <<'EOF'
+          kind: Cluster
+          apiVersion: kind.x-k8s.io/v1alpha4
+          nodes:
+            - role: control-plane
+              image: kindest/node:v1.31.0
+          EOF
+          kind create cluster --name "$KIND_CLUSTER_NAME" --config /tmp/kind-config.yaml --wait 90s
+          kubectl config current-context
+          kubectl get nodes
+          kubectl taint nodes ${KIND_CLUSTER_NAME}-control-plane CriticalAddonsOnly:NoSchedule || true
+
+      - name: Install KWOK CRDs + controller
+        run: |
+          set -euo pipefail
+          # Use karpenter-core's install-kwok.sh (referenced via go.mod dep dir).
+          # This installs KWOK controller + kwok stage/policy configs into the cluster.
+          KARPENTER_CORE_DIR=$(go list -m -f '{{ .Dir }}' sigs.k8s.io/karpenter)
+          echo "KARPENTER_CORE_DIR=$KARPENTER_CORE_DIR"
+          chmod +x "$KARPENTER_CORE_DIR/hack/install-kwok.sh"
+          UNINSTALL_KWOK=false "$KARPENTER_CORE_DIR/hack/install-kwok.sh"
+          kubectl -n kube-system rollout status deploy/kwok-controller --timeout=120s || true
+          kubectl get pods -A
+
+      - name: Build + load aws-provider kwok controller image into KIND
+        run: |
+          set -euo pipefail
+          # ko build the aws-provider kwok binary and side-load into kind
+          cd "$GITHUB_WORKSPACE"
+          IMG=$(KO_DOCKER_REPO=kind.local ko build --bare ./kwok)
+          echo "built image: $IMG"
+          echo "IMG=$IMG" >> "$GITHUB_ENV"
+
+      - name: Deploy aws-provider kwok karpenter via helm
+        env:
+          IMG: ${{ env.IMG }}
+        run: |
+          set -euo pipefail
+          # Apply CRDs first
+          kubectl apply -f ./pkg/apis/crds/
+          # Apply the kwok-specific ClusterRole (referenced in kwok/Makefile)
+          KARPENTER_NAMESPACE=kube-system envsubst < ./kwok/manifests/clusterrole.yaml | kubectl apply -f -
+          IMG_REPOSITORY=$(echo "$IMG" | cut -d "@" -f 1 | cut -d ":" -f 1)
+          IMG_DIGEST=$(echo "$IMG" | cut -d "@" -f 2)
+          echo "deploying $IMG_REPOSITORY @ $IMG_DIGEST"
+          helm upgrade --install kwok-karpenter ./charts/karpenter \
+            --namespace kube-system \
+            --create-namespace \
+            --set controller.image.repository="$IMG_REPOSITORY" \
+            --set controller.image.tag="ko-build" \
+            --set controller.image.digest="$IMG_DIGEST" \
+            --set settings.clusterName="$CLUSTER_NAME" \
+            --set settings.clusterEndpoint="$CLUSTER_ENDPOINT" \
+            --set settings.featureGates.reservedCapacity=false \
+            --set settings.enableZonalShift=false \
+            --set controller.resources.requests.cpu=1 \
+            --set controller.resources.requests.memory=1Gi \
+            --set controller.resources.limits.cpu=2 \
+            --set controller.resources.limits.memory=2Gi \
+            --set logLevel=debug \
+            --set-string controller.env[0].name=AWS_ENDPOINT_URL \
+            --set-string controller.env[0].value=http://host.docker.internal:5000 \
+            --set-string controller.env[1].name=AWS_ACCESS_KEY_ID \
+            --set-string controller.env[1].value=test \
+            --set-string controller.env[2].name=AWS_SECRET_ACCESS_KEY \
+            --set-string controller.env[2].value=test \
+            --set-string controller.env[3].name=AWS_REGION \
+            --set-string controller.env[3].value=us-west-2 \
+            --set-string controller.env[4].name=CLUSTER_ENDPOINT \
+            --set-string controller.env[4].value="$CLUSTER_ENDPOINT"
+
+      - name: Wait for kwok-karpenter to become ready
+        run: |
+          set -euo pipefail
+          # Give it up to 3 minutes to boot (moto bootstrap can be slow)
+          for i in $(seq 1 36); do
+            READY=$(kubectl -n kube-system get pods -l app.kubernetes.io/name=karpenter -o jsonpath='{.items[*].status.containerStatuses[*].ready}' 2>/dev/null || echo "")
+            if [[ "$READY" == "true" ]]; then
+              echo "karpenter is ready"
+              break
+            fi
+            echo "waiting for karpenter ready ($i/36)..."
+            kubectl -n kube-system get pods -l app.kubernetes.io/name=karpenter 2>&1 | head -20 || true
+            sleep 5
+          done
+          kubectl -n kube-system get pods -l app.kubernetes.io/name=karpenter
+          # Dump logs regardless — this is what we want to inspect on failure
+          kubectl -n kube-system logs -l app.kubernetes.io/name=karpenter --tail=200 || true
+
+      - name: Run performance suite (kwok mode)
+        id: run_perf
+        continue-on-error: true
+        env:
+          FOCUS: ${{ inputs.focus }}
+        run: |
+          set -euo pipefail
+          OUTPUT_DIR=$(mktemp -d)
+          export OUTPUT_DIR
+          echo "OUTPUT_DIR=$OUTPUT_DIR" >> "$GITHUB_ENV"
+          # The perf suite uses aws.NewEnvironment which needs CLUSTER_NAME +
+          # CLUSTER_ENDPOINT set (already exported). It calls AWS APIs via SDK,
+          # so those go through AWS_ENDPOINT_URL to moto.
+          TEST_SUITE=Performance FOCUS="$FOCUS" make e2etests 2>&1 | tee "$OUTPUT_DIR/test-output.log"
+
+      - name: Dump karpenter logs
+        if: always()
+        run: |
+          kubectl -n kube-system logs -l app.kubernetes.io/name=karpenter --tail=500 > "$OUTPUT_DIR/karpenter.log" 2>&1 || true
+          kubectl get pods -A -o wide > "$OUTPUT_DIR/pods.txt" 2>&1 || true
+          kubectl get nodes -o wide > "$OUTPUT_DIR/nodes.txt" 2>&1 || true
+          kubectl get nodepools,nodeclaims,ec2nodeclasses -A -o yaml > "$OUTPUT_DIR/kperf.yaml" 2>&1 || true
+
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ga-ab-kind-kwok-run-${{ inputs.run_id }}-${{ github.sha }}
+          path: |
+            ${{ env.OUTPUT_DIR }}/*
+          retention-days: 14
+          if-no-files-found: warn
+
+      - name: Fail if perf test failed
+        if: steps.run_perf.outcome == 'failure'
+        run: |
+          echo "Performance suite failed — see uploaded artifacts."
+          exit 1
