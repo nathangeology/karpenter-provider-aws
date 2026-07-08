@@ -25,6 +25,7 @@ on:
           - Chaos
           - IPv6
           - Scale
+          - Performance
           - PrivateCluster
           - LocalZone
       k8s_version:
