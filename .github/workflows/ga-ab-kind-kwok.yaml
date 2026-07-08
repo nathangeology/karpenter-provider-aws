@@ -233,10 +233,22 @@ jobs:
           kubectl apply -f ./pkg/apis/crds/
           # Apply the kwok-specific ClusterRole (referenced in kwok/Makefile)
           KARPENTER_NAMESPACE=kube-system envsubst < ./kwok/manifests/clusterrole.yaml | kubectl apply -f -
-          # ko (without --bare) prints repo:tag@digest. Extract components.
-          IMG_REPOSITORY=$(echo "$IMG" | cut -d "@" -f 1 | cut -d ":" -f 1)
-          IMG_TAG=$(echo "$IMG" | cut -d "@" -f 1 | cut -d ":" -f 2 -s)
-          IMG_DIGEST=$(echo "$IMG" | cut -d "@" -f 2)
+          # ko (without --bare) targeting kind.local prints "repo:tag" (no
+          # digest suffix, no '@'). The prior parser assumed "repo:tag@digest"
+          # and produced an IMG_DIGEST equal to the whole string when no '@'
+          # was present, which made the helm chart's image template render
+          # "repo:tag@repo:tag" -> InvalidImageName. Handle both forms.
+          if [[ "$IMG" == *"@"* ]]; then
+            IMG_REF="${IMG%@*}"
+            IMG_DIGEST="${IMG#*@}"
+          else
+            IMG_REF="$IMG"
+            IMG_DIGEST=""
+          fi
+          IMG_REPOSITORY="${IMG_REF%:*}"
+          IMG_TAG="${IMG_REF##*:}"
+          # If somehow no ':' was present, cut fell through
+          [ "$IMG_REPOSITORY" = "$IMG_TAG" ] && IMG_TAG="latest"
           echo "deploying repository=$IMG_REPOSITORY tag=$IMG_TAG digest=$IMG_DIGEST"
           # Tolerate the CriticalAddonsOnly:NoSchedule taint on the control-plane
           # node (see 'Create KIND cluster' step). The default chart already
@@ -250,12 +262,17 @@ jobs:
           # single-node KIND control-plane (no zone label). Kept the default
           # in place is what left the pod Pending in iteration 0 despite the
           # toleration being applied (kp-mkukch iter 1).
+          # Build the helm arg list; only include image.digest when non-empty
+          # so that the karpenter.controller.image template doesn't emit an
+          # invalid "repo:tag@" reference.
+          HELM_IMG_ARGS=(--set "controller.image.repository=$IMG_REPOSITORY" --set "controller.image.tag=$IMG_TAG")
+          if [ -n "$IMG_DIGEST" ]; then
+            HELM_IMG_ARGS+=(--set "controller.image.digest=$IMG_DIGEST")
+          fi
           helm upgrade --install kwok-karpenter ./charts/karpenter \
             --namespace kube-system \
             --create-namespace \
-            --set controller.image.repository="$IMG_REPOSITORY" \
-            --set controller.image.tag="$IMG_TAG" \
-            --set controller.image.digest="$IMG_DIGEST" \
+            "${HELM_IMG_ARGS[@]}" \
             --set settings.clusterName="$CLUSTER_NAME" \
             --set settings.clusterEndpoint="$CLUSTER_ENDPOINT" \
             --set settings.featureGates.reservedCapacity=false \
