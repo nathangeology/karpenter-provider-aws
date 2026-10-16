@@ -311,6 +311,11 @@ func (c *CloudProvider) GetSupportedNodeClasses() []status.Object {
 	return []status.Object{&v1.EC2NodeClass{}}
 }
 
+// RepairPolicies returns the complete policy set. Ready=False is the set's single default
+// fallback, so it carries no ReasonRegex; every other policy matches any reason. Each policy
+// requests ReplaceNode at equal priority and inherits the NodePool/NodeClaim
+// TerminationGracePeriod, which is the behaviour this provider had before RepairPolicy gained
+// Action, ReasonRegex and Priority.
 func (c *CloudProvider) RepairPolicies() []cloudprovider.RepairPolicy {
 	return []cloudprovider.RepairPolicy{
 		// Supported Kubelet Node Conditions
@@ -318,38 +323,51 @@ func (c *CloudProvider) RepairPolicies() []cloudprovider.RepairPolicy {
 			ConditionType:      corev1.NodeReady,
 			ConditionStatus:    corev1.ConditionFalse,
 			TolerationDuration: 30 * time.Minute,
+			Action:             cloudprovider.ReplaceNode,
 		},
 		{
 			ConditionType:      corev1.NodeReady,
 			ConditionStatus:    corev1.ConditionUnknown,
+			ReasonRegex:        ".*",
 			TolerationDuration: 30 * time.Minute,
+			Action:             cloudprovider.ReplaceNode,
 		},
 		// Support Node Monitoring Agent Conditions
 		//
 		{
 			ConditionType:      "AcceleratedHardwareReady",
 			ConditionStatus:    corev1.ConditionFalse,
+			ReasonRegex:        ".*",
 			TolerationDuration: 10 * time.Minute,
+			Action:             cloudprovider.ReplaceNode,
 		},
 		{
 			ConditionType:      "StorageReady",
 			ConditionStatus:    corev1.ConditionFalse,
+			ReasonRegex:        ".*",
 			TolerationDuration: 30 * time.Minute,
+			Action:             cloudprovider.ReplaceNode,
 		},
 		{
 			ConditionType:      "NetworkingReady",
 			ConditionStatus:    corev1.ConditionFalse,
+			ReasonRegex:        ".*",
 			TolerationDuration: 30 * time.Minute,
+			Action:             cloudprovider.ReplaceNode,
 		},
 		{
 			ConditionType:      "KernelReady",
 			ConditionStatus:    corev1.ConditionFalse,
+			ReasonRegex:        ".*",
 			TolerationDuration: 30 * time.Minute,
+			Action:             cloudprovider.ReplaceNode,
 		},
 		{
 			ConditionType:      "ContainerRuntimeReady",
 			ConditionStatus:    corev1.ConditionFalse,
+			ReasonRegex:        ".*",
 			TolerationDuration: 30 * time.Minute,
+			Action:             cloudprovider.ReplaceNode,
 		},
 	}
 }
