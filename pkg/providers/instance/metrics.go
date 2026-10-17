@@ -24,8 +24,19 @@ import (
 
 const (
 	cloudProviderSubsystem = "cloudprovider"
-	zoneLabel              = "zone"
+	zoneLabel              = metrics.ZoneLabel
 	zoneIDLabel            = "zone_id"
+)
+
+var (
+	ZoneID = opmetrics.Label{
+		Name: zoneIDLabel,
+		Help: "The availability zone ID of the offering, which is stable across accounts.",
+	}
+	LaunchFailureReason = opmetrics.Label{
+		Name: metrics.ReasonLabel,
+		Help: "The CreateFleet error code that rejected the offering.",
+	}
 )
 
 var (
@@ -39,12 +50,13 @@ var (
 			Name:      "instance_launch_failures_total",
 			Help:      "Number of instance launch (CreateFleet offering) failures, dimensioned by availability zone, zone ID, capacity type, and launch failure reason.",
 		},
-		[]string{
-			zoneLabel,
-			zoneIDLabel,
-			metrics.CapacityTypeLabel,
-			metrics.ReasonLabel,
+		[]opmetrics.Label{
+			metrics.Zone,
+			ZoneID,
+			metrics.CapacityType,
+			LaunchFailureReason,
 		},
+		opmetrics.Beta,
 	)
 	InstanceTerminationFailuresTotal = opmetrics.NewPrometheusCounter(
 		crmetrics.Registry,
@@ -54,9 +66,10 @@ var (
 			Name:      "instance_termination_failures_total",
 			Help:      "Number of instance termination (TerminateInstances) failures, dimensioned by availability zone and zone ID.",
 		},
-		[]string{
-			zoneLabel,
-			zoneIDLabel,
+		[]opmetrics.Label{
+			metrics.Zone,
+			ZoneID,
 		},
+		opmetrics.Beta,
 	)
 )

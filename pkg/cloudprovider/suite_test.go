@@ -50,11 +50,14 @@ import (
 
 	karpv1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	corecloudprovider "sigs.k8s.io/karpenter/pkg/cloudprovider"
+	"sigs.k8s.io/karpenter/pkg/controllers/dynamicresources/deviceallocation"
 	"sigs.k8s.io/karpenter/pkg/controllers/provisioning"
 	"sigs.k8s.io/karpenter/pkg/controllers/state"
 	"sigs.k8s.io/karpenter/pkg/events"
 	coreoptions "sigs.k8s.io/karpenter/pkg/operator/options"
 	"sigs.k8s.io/karpenter/pkg/scheduling"
+	"sigs.k8s.io/karpenter/pkg/state/prediction"
+	"sigs.k8s.io/karpenter/pkg/state/virtualpods"
 	coretest "sigs.k8s.io/karpenter/pkg/test"
 
 	. "github.com/onsi/ginkgo/v2"
@@ -95,7 +98,7 @@ var _ = BeforeSuite(func() {
 	cloudProvider = cloudprovider.New(awsEnv.InstanceTypesProvider, awsEnv.InstanceProvider, recorder,
 		env.Client, awsEnv.AMIProvider, awsEnv.SecurityGroupProvider, awsEnv.CapacityReservationProvider, awsEnv.PlacementGroupProvider, awsEnv.InstanceTypeStore, lo.ToPtr("test-ca-bundle"))
 	cluster = state.NewCluster(fakeClock, env.Client, cloudProvider)
-	prov = provisioning.NewProvisioner(env.Client, recorder, cloudProvider, cluster, fakeClock)
+	prov = provisioning.NewProvisioner(env.Client, recorder, cloudProvider, cluster, fakeClock, deviceallocation.NewController(env.Client), virtualpods.NewVirtualPodCache(env.Client), prediction.NewStore(env.Client))
 })
 
 var _ = AfterSuite(func() {
@@ -1320,8 +1323,8 @@ var _ = Describe("CloudProvider", func() {
 			pod1 := coretest.UnschedulablePod(coretest.PodOptions{NodeSelector: map[string]string{corev1.LabelTopologyZone: "test-zone-1a"}})
 			ExpectApplied(ctx, env.Client, nodePool, nodeClass, pod1)
 			awsEnv.EC2API.CreateFleetBehavior.Error.Set(fmt.Errorf("CreateFleet synthetic error"))
-			bindings := ExpectProvisioned(ctx, env.Client, cluster, cloudProvider, prov, pod1)
-			Expect(len(bindings)).To(Equal(0))
+			result := ExpectProvisioned(ctx, env.Client, cluster, cloudProvider, prov, pod1)
+			Expect(result.Bindings).To(BeEmpty())
 		})
 		It("should launch instances into subnets that are excluded by another NodePool", func() {
 			awsEnv.EC2API.Subnets.Store("test-zone-1a", ec2types.Subnet{

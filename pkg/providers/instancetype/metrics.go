@@ -28,6 +28,15 @@ const (
 )
 
 var (
+	// InstanceType is declared here rather than imported from pkg/controllers/metrics so that
+	// a provider package does not depend on a controller package.
+	InstanceType = opmetrics.Label{
+		Name: instanceTypeLabel,
+		Help: "The EC2 instance type the value describes.",
+	}
+)
+
+var (
 	InstanceTypeVCPU = opmetrics.NewPrometheusGauge(
 		crmetrics.Registry,
 		prometheus.GaugeOpts{
@@ -36,9 +45,10 @@ var (
 			Name:      "instance_type_cpu_cores",
 			Help:      "VCPUs cores for a given instance type.",
 		},
-		[]string{
-			instanceTypeLabel,
+		[]opmetrics.Label{
+			InstanceType,
 		},
+		opmetrics.Beta,
 	)
 	InstanceTypeMemory = opmetrics.NewPrometheusGauge(
 		crmetrics.Registry,
@@ -48,8 +58,9 @@ var (
 			Name:      "instance_type_memory_bytes",
 			Help:      "Memory, in bytes, for a given instance type.",
 		},
-		[]string{
-			instanceTypeLabel,
+		[]opmetrics.Label{
+			InstanceType,
 		},
+		opmetrics.Beta,
 	)
 )

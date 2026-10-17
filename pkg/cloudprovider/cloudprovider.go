@@ -293,6 +293,15 @@ func (c *CloudProvider) IsDrifted(ctx context.Context, nodeClaim *karpv1.NodeCla
 	return driftReason, nil
 }
 
+// Reboot is not implemented. EC2 exposes RebootInstances, but wiring it up is a behavioural
+// change that needs its own design: the core reboot controller observes recovery and treats a
+// *NodeRebootFailedError as terminal, so a provider that accepts reboots without that work
+// would silently change node-repair outcomes. Returning NodeRebootNotImplementedError is the
+// contract the interface prescribes for providers without in-place reboot.
+func (c *CloudProvider) Reboot(_ context.Context, _ *karpv1.NodeClaim, _ string) error {
+	return cloudprovider.NewNodeRebootNotImplementedError()
+}
+
 // Name returns the CloudProvider implementation name.
 func (c *CloudProvider) Name() string {
 	return "aws"

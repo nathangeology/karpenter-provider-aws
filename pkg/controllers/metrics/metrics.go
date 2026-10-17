@@ -24,8 +24,17 @@ import (
 const (
 	cloudProviderSubsystem = "cloudprovider"
 	instanceTypeLabel      = "instance_type"
-	capacityTypeLabel      = "capacity_type"
-	zoneLabel              = "zone"
+	capacityTypeLabel      = metrics.CapacityTypeLabel
+	zoneLabel              = metrics.ZoneLabel
+)
+
+var (
+	// InstanceType is the EC2 instance type dimension. Core declares no equivalent, so
+	// it is owned here; capacity type and zone reuse the core Labels.
+	InstanceType = opmetrics.Label{
+		Name: instanceTypeLabel,
+		Help: "The EC2 instance type of the offering.",
+	}
 )
 
 var (
@@ -37,11 +46,12 @@ var (
 			Name:      "instance_type_offering_available",
 			Help:      "Instance type offering availability, based on instance type, capacity type, and zone",
 		},
-		[]string{
-			instanceTypeLabel,
-			capacityTypeLabel,
-			zoneLabel,
+		[]opmetrics.Label{
+			InstanceType,
+			metrics.CapacityType,
+			metrics.Zone,
 		},
+		opmetrics.Beta,
 	)
 	InstanceTypeOfferingPriceEstimate = opmetrics.NewPrometheusGauge(
 		crmetrics.Registry,
@@ -51,10 +61,11 @@ var (
 			Name:      "instance_type_offering_price_estimate",
 			Help:      "Instance type offering estimated hourly price used when making informed decisions on node cost calculation, based on instance type, capacity type, and zone.",
 		},
-		[]string{
-			instanceTypeLabel,
-			capacityTypeLabel,
-			zoneLabel,
+		[]opmetrics.Label{
+			InstanceType,
+			metrics.CapacityType,
+			metrics.Zone,
 		},
+		opmetrics.Beta,
 	)
 )

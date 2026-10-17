@@ -43,6 +43,10 @@ var _ corecloudprovider.CloudProvider = (*CloudProvider)(nil)
 type CloudProvider struct {
 	InstanceTypes []*corecloudprovider.InstanceType
 	ValidAMIs     []string
+	// RebootErr is what Reboot returns. Nil means the reboot was accepted; set it to a
+	// *corecloudprovider.NodeRebootNotImplementedError or NodeRebootFailedError to exercise
+	// the core reboot controller's unsupported and terminal paths.
+	RebootErr error
 }
 
 func (c *CloudProvider) Create(_ context.Context, _ *karpv1.NodeClaim) (*karpv1.NodeClaim, error) {
@@ -80,6 +84,10 @@ func (c *CloudProvider) List(context.Context) ([]*karpv1.NodeClaim, error) {
 
 func (c *CloudProvider) Delete(context.Context, *karpv1.NodeClaim) error {
 	return nil
+}
+
+func (c *CloudProvider) Reboot(_ context.Context, _ *karpv1.NodeClaim, _ string) error {
+	return c.RebootErr
 }
 
 func (c *CloudProvider) DisruptionReasons() []karpv1.DisruptionReason {
